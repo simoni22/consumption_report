@@ -1,0 +1,234 @@
+pipeline {
+    agent any
+    
+    options {
+        // Disable concurrent builds to prevent output file corruption
+        disableConcurrentBuilds()
+    }
+    
+    triggers {
+        // Run on the 2nd of every month at 9:00 AM
+        // Cron format: minute hour day month dayOfWeek
+        cron('0 9 2 * *')
+    }
+    
+    environment {
+        // Jenkins automatically checks out code to WORKSPACE, use it directly
+        REPO_DIR = "${WORKSPACE}"
+        GRACE_PERIODS_FILE = "${WORKSPACE}/grace_periods.xlsx"
+        OUTPUT_FILE = "${env.HOME}/consumption_report/consumption_report.xlsx"
+        PYTHON_ENV = "${WORKSPACE}/env/bin/python3"
+        DEVOPS_EMAIL = "aaa@gmail.com"  // DevOps email for error notifications
+    }
+    
+    stages {
+        stage('Setup Python Environment') {
+            steps {                script {
+                    echo "Setting up Python virtual environment"
+                    
+                    // Check if virtual environment exists
+                    def venvExists = sh(
+                        script: "test -d ${REPO_DIR}/env && echo 'true' || echo 'false'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (venvExists == 'false') {
+                        echo "Creating virtual environment and installing requirements..."
+                        sh """
+                            cd ${REPO_DIR}
+                            python3 -m venv env
+                            ${REPO_DIR}/env/bin/pip install --upgrade pip
+                            ${REPO_DIR}/env/bin/pip install -r requirements.txt
+                        """
+                    } else {
+                        echo "Virtual environment exists, ensuring requirements are up to date..."
+                        sh """
+                            cd ${REPO_DIR}
+                            ${REPO_DIR}/env/bin/pip install --upgrade pip
+                            ${REPO_DIR}/env/bin/pip install -r requirements.txt
+                        """
+                    }
+                    
+                    echo "Python environment ready"
+                }
+            }
+        }
+        
+        stage('Verify Output Directory') {
+            steps {
+                script {
+                    echo "Ensuring output directory exists"
+                    sh "mkdir -p ${env.HOME}/consumption_report"
+                }
+            }
+        }
+        
+        stage('Process Departments') {
+            steps {
+                script {
+                    echo "Reading department list and email addresses from grace_periods.xlsx"
+                    
+                    // Track failures for summary
+                    def failedDepartments = []
+                    def successfulDepartments = []
+                    
+                    // Read the grace_periods.xlsx file and parse it
+                    // Note: Only Department and mail columns are used here
+                    def pythonScript = """
+import pandas as pd
+import sys
+
+df = pd.read_excel('${GRACE_PERIODS_FILE}')
+# Output each row as: Department|Email (start/end columns not needed here)
+for _, row in df.iterrows():
+    print('{}|{}'.format(row['Department'], row['mail']))
+"""
+                    
+                    // Execute Python script to read Excel file
+                    def gracePeriods = sh(
+                        script: "cd ${REPO_DIR} && ${PYTHON_ENV} -c \"${pythonScript}\"",
+                        returnStdout: true
+                    ).trim().split('\n')
+                    
+                    echo "Found ${gracePeriods.size()} departments to process"
+                    
+                    // Iterate through each department
+                    gracePeriods.each { line ->
+                        def parts = line.split('\\|')
+                        def department = parts[0].trim()
+                        def email = parts[1].trim()
+                        
+                        echo "=========================================="
+                        echo "Processing Department: ${department}"
+                        echo "Email: ${email}"
+                        echo "=========================================="
+                        
+                        // Get previous month and year (report runs on 1st but reports previous month)
+                        def dateInfo = sh(
+                            script: "date -d 'last month' '+%m %Y'",
+                            returnStdout: true
+                        ).trim().split(' ')
+                        
+                        def previousMonth = dateInfo[0].replaceFirst("^0+(?!\$)", "")
+                        def reportYear = dateInfo[1]
+                        
+                        try {
+                            // Run the consumption report for this department
+                            echo "Generating report for ${department} - Month: ${previousMonth}/${reportYear}"
+                            
+                            sh """
+                                cd ${REPO_DIR}
+                                ${PYTHON_ENV} consumption_report.py --month ${previousMonth} ${reportYear} --Project ${department}
+                            """
+                            
+                            echo "Report generated successfully for ${department}"
+                            
+                            // Check if output file exists
+                            def fileExists = sh(
+                                script: "test -f ${OUTPUT_FILE} && echo 'true' || echo 'false'",
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (fileExists == 'true') {
+                                // Copy report to workspace for email attachment
+                                def workspaceReport = "consumption_report_${department}_${previousMonth}_${reportYear}.xlsx"
+                                sh "cp ${OUTPUT_FILE} ${WORKSPACE}/${workspaceReport}"
+                                
+                                // Send email with the report attached
+                                emailext (
+                                    subject: "DO NOT REPLY: Consumption Report - ${department} - ${previousMonth}/${reportYear}",
+                                    body: """
+Hello,
+
+Please find attached the consumption report for department: ${department}
+Report Period: ${previousMonth}/${reportYear}
+
+Best regards,
+HPC DevOps team.
+                                    """,
+                                    to: email,
+                                    attachmentsPattern: workspaceReport,
+                                    mimeType: 'text/plain'
+                                )
+                                echo "Email sent successfully to ${email}"
+                                successfulDepartments.add(department)
+                                
+                                // Clean up workspace copy
+                                sh "rm -f ${WORKSPACE}/${workspaceReport}"
+                            } else {
+                                echo "WARNING: Output file not found for ${department}"
+                                failedDepartments.add("${department}: Output file not created")
+                            }
+                            
+                        } catch (Exception e) {
+                            echo "ERROR processing ${department}: ${e.message}"
+                            failedDepartments.add("${department}: ${e.message}")
+                        }
+                        
+                        // Small delay between processing departments
+                        sleep(time: 2, unit: 'SECONDS')
+                    }
+                    
+                    // Store results for post-build summary
+                    env.SUCCESSFUL_COUNT = successfulDepartments.size().toString()
+                    env.FAILED_COUNT = failedDepartments.size().toString()
+                    env.FAILED_DETAILS = failedDepartments.isEmpty() ? "None" : failedDepartments.join("\n  - ")
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "Automated report generation completed"
+                
+                // Get completion time
+                def completionTime = new Date().format('yyyy-MM-dd HH:mm:ss')
+                
+                // Calculate previous month for reference
+                def dateInfo = sh(
+                    script: "date -d 'last month' '+%B %Y'",
+                    returnStdout: true
+                ).trim()
+                
+                // Send monitoring notification to DevOps
+                emailext (
+                    subject: "[Jenkins Monitor] Monthly Report Job ${currentBuild.currentResult} - ${dateInfo}",
+                    body: """
+JENKINS MONTHLY REPORT JOB - EXECUTION SUMMARY
+
+Status: ${currentBuild.currentResult}
+Completion Time: ${completionTime}
+Report Period: ${dateInfo}
+Duration: ${currentBuild.durationString}
+
+RESULTS:
+- Successful: ${env.SUCCESSFUL_COUNT ?: '0'} departments
+- Failed: ${env.FAILED_COUNT ?: '0'} departments
+
+${env.FAILED_COUNT != '0' ? """
+FAILED DEPARTMENTS:
+  - ${env.FAILED_DETAILS}
+""" : 'All reports were generated and sent successfully.'}
+
+Build URL: ${env.BUILD_URL}
+Console Output: ${env.BUILD_URL}console
+
+Great job team,
+I'll be back
+Jenkins
+                    """,
+                    to: DEVOPS_EMAIL,
+                    mimeType: 'text/plain'
+                )
+            }
+        }
+        success {
+            echo "All reports processed successfully"
+        }
+        failure {
+            echo "Some reports failed to process. Check logs for details."
+        }
+    }
+}

@@ -1,0 +1,6 @@
+.vscode
+env
+__pycache__
+*.nfs*
+consumption*.xlsx
+test.py

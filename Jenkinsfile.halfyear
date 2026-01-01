@@ -1,0 +1,198 @@
+pipeline {
+    agent any
+    
+    options {
+        // Disable concurrent builds to prevent output file corruption
+        disableConcurrentBuilds()
+    }
+    
+    triggers {
+        // Run on January 1st and July 1st at 9:00 AM
+        // Cron format: minute hour day month dayOfWeek
+        cron('0 9 1 1,7 *')
+    }
+    
+    environment {
+        // Jenkins automatically checks out code to WORKSPACE, use it directly
+        REPO_DIR = "${WORKSPACE}"
+        OUTPUT_FILE = "${env.HOME}/consumption_report/consumption_report_adjusted.xlsx"
+        PYTHON_ENV = "${WORKSPACE}/env/bin/python3"
+        DEVOPS_EMAIL = "aaa@gmail.com"
+    }
+    
+    stages {
+        stage('Setup Python Environment') {
+            steps {
+                script {
+                    echo "Setting up Python virtual environment"
+                    
+                    // Check if virtual environment exists
+                    def venvExists = sh(
+                        script: "test -d ${REPO_DIR}/env && echo 'true' || echo 'false'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (venvExists == 'false') {
+                        echo "Creating virtual environment and installing requirements..."
+                        sh """
+                            cd ${REPO_DIR}
+                            python3 -m venv env
+                            ${REPO_DIR}/env/bin/pip install --upgrade pip
+                            ${REPO_DIR}/env/bin/pip install -r requirements.txt
+                        """
+                    } else {
+                        echo "Virtual environment exists, ensuring requirements are up to date..."
+                        sh """
+                            cd ${REPO_DIR}
+                            ${REPO_DIR}/env/bin/pip install --upgrade pip
+                            ${REPO_DIR}/env/bin/pip install -r requirements.txt
+                        """
+                    }
+                    
+                    echo "Python environment ready"
+                }
+            }
+        }
+        
+        stage('Verify Output Directory') {
+            steps {
+                script {
+                    echo "Ensuring output directory exists"
+                    sh "mkdir -p ${env.HOME}/consumption_report"
+                }
+            }
+        }
+        
+        stage('Generate Half-Year Report') {
+            steps {
+                script {
+                    echo "Determining half-year period..."
+                    
+                    // Get current month and year
+                    def currentMonth = sh(
+                        script: "date +%m",
+                        returnStdout: true
+                    ).trim().toInteger()
+                    
+                    def currentYear = sh(
+                        script: "date +%Y",
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Determine which half-year to report
+                    // Running on Jan 1 → Report H2 of previous year
+                    // Running on Jul 1 → Report H1 of current year
+                    def halfYear
+                    def reportYear
+                    def periodDescription
+                    
+                    if (currentMonth == 1) {
+                        halfYear = 2
+                        reportYear = (currentYear.toInteger() - 1).toString()
+                        periodDescription = "H2 ${reportYear} (Jul-Dec)"
+                    } else {
+                        halfYear = 1
+                        reportYear = currentYear
+                        periodDescription = "H1 ${reportYear} (Jan-Jun)"
+                    }
+                    
+                    echo "Generating Department report for ${periodDescription}"
+                    
+                    try {
+                        // Run the consumption report for all departments
+                        sh """
+                            cd ${REPO_DIR}
+                            ${PYTHON_ENV} consumption_report.py --half_year ${halfYear} ${reportYear} --Department
+                        """
+                        
+                        echo "Report generated successfully"
+                        
+                        // Check if output file exists
+                        def fileExists = sh(
+                            script: "test -f ${OUTPUT_FILE} && echo 'true' || echo 'false'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (fileExists == 'true') {
+                            // Copy report to workspace for email attachment
+                            def workspaceReport = "consumption_report_departments_H${halfYear}_${reportYear}.xlsx"
+                            sh "cp ${OUTPUT_FILE} ${WORKSPACE}/${workspaceReport}"
+                            
+                            // Get completion time
+                            def completionTime = new Date().format('yyyy-MM-dd HH:mm:ss')
+                            
+                            // Send email with the report attached
+                            emailext (
+                                subject: "Half-Year Consumption Report - ${periodDescription}",
+                                body: """
+Hello DevOps Team,
+
+Please find attached the half-year consumption report for all departments.
+
+Report Period: ${periodDescription}
+Generated: ${completionTime}
+
+This report includes aggregated consumption data for all departments during this period.
+
+Best regards,
+Jenkins
+                                """,
+                                to: DEVOPS_EMAIL,
+                                attachmentsPattern: workspaceReport,
+                                mimeType: 'text/plain'
+                            )
+                            
+                            echo "Report emailed successfully to DevOps team"
+                            
+                            // Clean up workspace copy
+                            sh "rm -f ${WORKSPACE}/${workspaceReport}"
+                            
+                        } else {
+                            error "Output file not found after report generation"
+                        }
+                        
+                    } catch (Exception e) {
+                        echo "ERROR: ${e.message}"
+                        
+                        // Get completion time
+                        def completionTime = new Date().format('yyyy-MM-dd HH:mm:ss')
+                        
+                        // Send failure notification
+                        emailext (
+                            subject: "[FAILED] Half-Year Consumption Report - ${periodDescription}",
+                            body: """
+REPORT GENERATION FAILED
+
+Report Period: ${periodDescription}
+Failed At: ${completionTime}
+Build: #${currentBuild.number}
+Error: ${e.message}
+
+The half-year consumption report generation failed.
+Please check the Jenkins console output for full details.
+
+Console: ${env.BUILD_URL}console
+
+---
+This is an automated failure notification.
+                            """,
+                            to: DEVOPS_EMAIL,
+                            mimeType: 'text/plain'
+                        )
+                        
+                        throw e
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "Half-year report generated and sent successfully"
+        }
+        failure {
+            echo "Half-year report generation failed. DevOps team has been notified."
+        }
+    }
+}
